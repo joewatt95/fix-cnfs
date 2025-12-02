@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "fix-cnfs"
+version = "0.1.0"
+description = "A CLI app to diagnose and fix DIMACS CNF files."
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+typer = {extras = ["all"], version = "^0.12.3"}
+async-typer = "^0.1.10"
+rich = "^13.7.1"
+aiofiles = "^23.2.1"
+parsy = "^2.1"
+python-sat = "^1.8.dev24"
+returns = "^0.26.0"
+
+[tool.poetry.scripts]
+fix-cnfs = "fix_cnfs.__main__:app"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
