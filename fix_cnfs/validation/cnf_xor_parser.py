@@ -42,160 +42,96 @@ def _get_line_col_from_index(content: str, index: int) -> tuple[int, int]:
         line_num += 1
     return line_num, col_num
 
+# --- 1. Base Definitions ---
 
-# --- Parsy-based CNF-XOR Parser Elements ---
+# Matches any sequence of whitespace (space, tab, newline, carriage return)
+# We use \s+ which includes \n and \r.
+whitespace = regex(r'\s+')
 
+# Matches a comment: starts with 'c', eats until end of line, eats the newline.
+# We handle both \n and \r\n.
+comment = regex(r'c.*')
 
-# Define a robust whitespace separator
-# Includes spaces, tabs, and newlines
-ws: Parser = regex(r'[ \t\n]+').desc("whitespace")
-ws_opt: Parser = ws.optional()
+# "Junk" is any combination of whitespace or comments.
+# It matches completely empty strings (optional), so it's safe to use everywhere.
+junk = (whitespace | comment).many()
 
+# --- 2. The Lexeme Factory ---
 
-# Basic elements
-integer: Parser = regex(r"-?[0-9]+").map(int)
-line_end: Parser = string("\n") | regex(
-    r"$")  # Handle final line without newline
+def lexeme(p: Parser) -> Parser:
+    """
+    Wraps a parser 'p' so that it consumes 'p' AND any trailing junk.
+    This is the secret to avoiding 'separator' hell.
+    """
+    return p << junk
 
-comment: Parser = regex(r"c[^\n]*") << line_end
-consumable_item: Parser = ws | comment
-# A separator is one or more chunks of consumable content
-separator: Parser = consumable_item.at_least(1)
+# --- 3. Atomic Tokens ---
 
-# Clause type parsers (CNF and XOR)
-literal_parser_with_ws = integer.skip(ws) | integer.skip(
-    ws_opt)  # Allow trailing whitespace
-terminator_parser: Parser = string("0").map(int).desc("clause terminator '0'")
+# The terminator '0'. We treat it as a string token.
+token_zero = lexeme(string("0"))
 
-# Use `sep_by` for the list of literals, followed by the terminator
+# The keyword 'p'.
+token_p = lexeme(string("p"))
 
+# The keyword 'cnf'.
+token_cnf = lexeme(string("cnf"))
 
-@generate
-def clause_core_parser() -> Generator[Parser, Any, Optional[List[int]]]:
-    """Parses the sequence of literals ending with '0'."""
-    # Parsy's `sep_by` can be tricky with a terminating element.
-    # A cleaner way is to parse the list of all integers (literals + 0)
-    # and then assert the last one is 0.
+# The keyword 'x'.
+token_x = lexeme(string("x"))
 
-    # Parse all integers separated by optional whitespace
-    all_ints: List[int] = yield integer.sep_by(ws, min=1)
+# A "Literal" is a non-zero integer.
+# We explicitly exclude 0 here to prevent the literal parser from eating the terminator.
+# Regex logic: Optional minus, then (1-9 followed by digits) OR (just 1-9)
+token_literal = lexeme(regex(r"-?[1-9][0-9]*").map(int)).desc("non-zero integer")
 
-    # Check for the mandatory 0 terminator
-    if all_ints[-1] != 0:
-        # If you want to handle this as a parse error (more robust)
-        # you'd need a custom parser, but for now, we'll assume the format is correct
-        # or use a different structure.
+# A generic integer (for the header, where 0 is theoretically possible as a count)
+token_int = lexeme(regex(r"-?[0-9]+").map(int))
 
-        # Let's stick to a simpler parsy approach by parsing the literals
-        # and then the terminator, skipping all intervening whitespace:
-
-        # Parse literals separated by required whitespace
-        literals: List[int] = yield integer.sep_by(ws, min=0)
-
-        # Now require the terminator, preceded by optional whitespace
-        yield ws_opt
-        yield terminator_parser  # Which is a string("0").map(int)
-
-        return literals
-
-# Simpler version focusing on parsing:
-
+# --- 4. Structural Parsers ---
 
 @generate
-def cnf_clause_parser() -> Generator[Parser, Any, CnfClause]:
-    """Parses a CNF clause: literals (ws-separated) 0, skipping intervening ws."""
-    # Parse literals separated by one or more whitespace characters (including newlines)
-    lits: List[int] = yield integer.sep_by(ws, min=0)
+def header_parser():
+    yield token_p
+    yield token_cnf
+    n_vars = yield token_int
+    n_clauses = yield token_int
+    return Header(num_vars=n_vars, num_clauses=n_clauses)
 
-    # Must be followed by optional whitespace before the final '0'
-    yield ws_opt
-    yield terminator_parser
-
-    # After the 0, we still need to account for the actual line ending or comment,
-    # but that is best handled in the main loop.
+@generate
+def cnf_clause_parser():
+    # A CNF clause is just a list of literals followed by zero
+    lits = yield token_literal.many()
+    yield token_zero
     return CnfClause(literals=lits)
 
-# The xor_clause_parser would be adjusted similarly:
-
-
 @generate
-def xor_clause_parser() -> Generator[Parser, Any, XorClause]:
-    """Parses an XOR clause: x <literals> 0, skipping intervening ws."""
-    yield string("x") >> ws  # Require "x" followed by whitespace
-    lits: List[int] = yield integer.sep_by(ws, min=0)
-
-    yield ws_opt
-    yield terminator_parser
-
+def xor_clause_parser():
+    # An XOR clause is 'x', list of literals, followed by zero
+    yield token_x
+    lits = yield token_literal.many()
+    yield token_zero
     return XorClause(literals=lits)
 
-
-# Combined clause parser
-clause_parser_instance: Parser = (
-    cnf_clause_parser | xor_clause_parser).desc("CNF or XOR clause")
-
-# Redefine the main parser to use a separator for comments/whitespace
-
-ignored: Parser = (comment | ws).many()  # Sequence of comments and whitespace
-
-# Header line: "p cnf <num_vars> <num_clauses>"
-p_line: Parser = (
-    string("p")
-    >> ws
-    >> string("cnf")
-    >> ws
-    # Use seq() on the two items we actually want to keep/return
-    >> seq(
-        integer.skip(ws),  # Result 1: num_vars
-        integer.skip(ws_opt)  # Result 2: num_clauses
-    )
-).desc("header line 'p cnf <num_vars> <num_clauses>'")
-
+# Combined clause parser (Try XOR first, then CNF)
+clause_parser = xor_clause_parser | cnf_clause_parser
 
 @generate
-def header_parser() -> Generator[Parser, Any, Header]:
-    """Parses the header, skipping any preceding comments/ws, returning a Header NamedTuple."""
-    yield (comment | ws).many()
-
-    # h_tuple will be (num_vars, num_clauses)
-    h_tuple: tuple[int, int] = yield p_line
-
-    # After the header, consume the rest of the line/comments
-    yield (ws_opt >> comment | ws_opt >> line_end).optional()
-
-    # Unpack the tuple positionally
-    return Header(num_vars=h_tuple[0], num_clauses=h_tuple[1])
-
-
-# @generate
-# def header_parser() -> Generator[Parser, Any, Header]:
-#     """Parses the header, skipping any preceding comments, returning a Header NamedTuple."""
-#     # Skip any comments and whitespace before the 'p' line
-#     yield (comment | ws).many()
-
-#     h_dict = yield p_line
-
-#     # After the header, consume the rest of the line (newline, comment, or EOF)
-#     yield (comment | line_end).optional()
-
-#     return Header(num_vars=h_dict["num_vars"], num_clauses=h_dict["num_clauses"])
-
-@generate
-def _cnf_xor_data_parser() -> Generator[Parser, Any, CnfXorFile]:
-
-    # Consume all initial junk (comments/whitespace) before header
-    yield consumable_item.many()
-
-    header: Header = yield header_parser
-
-    # Parse all clauses, separated by required, consumable content
-    # Note: We must allow zero clauses in case num_clauses is 0, so we use optional() or min=0.
-    clauses: List[Clause] = yield clause_parser_instance.sep_by(separator, min=0)
-
-    # Consume all trailing junk (comments/whitespace)
-    yield consumable_item.many()
+def cnf_xor_file_parser_internal():
+    # 1. Eat initial junk (BOM, leading comments, empty lines)
+    yield junk
+    
+    # 2. Parse Header
+    header = yield header_parser
+    
+    # 3. Parse Clauses
+    # Since 'junk' is eaten by the tokens themselves, 
+    # we just look for 'many' clauses.
+    clauses = yield clause_parser.many()
+    
+    # 4. Ensure we are at the end of the file
+    # (The last token parsed (0) already ate trailing junk, so we just check eof)
     yield eof
-
+    
     return CnfXorFile(header=header, clauses=clauses)
 
 
@@ -204,6 +140,6 @@ def cnf_xor_file_parser(content: str) -> CnfXorFile:
     Parses the full content of a CNF-XOR file and returns a CnfXorFile object
     that includes the original content.
     """
-    parsed_data = _cnf_xor_data_parser.parse(content)
+    parsed_data = cnf_xor_file_parser_internal.parse(content)
     # print("\n01234\n")
     return parsed_data._replace(original_content=content)
